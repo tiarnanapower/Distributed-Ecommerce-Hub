@@ -1,0 +1,1700 @@
+// ---------------------------------------------------------------------------
+// Commerce Command Center — data model
+//
+// Portability notes (see docs/database.md):
+//  * SQLite is the local development datastore. It does not support Prisma
+//    `enum` types, so every enumerated column is a `String` whose allowed values
+//    are defined once in TypeScript under `src/lib/enums.ts` and validated with
+//    Zod at every boundary. Swapping the datasource to PostgreSQL is a
+//    mechanical change: convert those columns to native enums if desired.
+//  * Structured payloads are stored as JSON *text* in `*Json` columns rather
+//    than a native JSON type, for the same portability reason. They are read
+//    and written through typed helpers in `src/lib/json.ts`.
+//  * Money is stored as an exact decimal *string* alongside an ISO-4217
+//    currency code, never as a float. All arithmetic goes through
+//    `src/lib/money.ts`, which is backed by bigint minor units. Under
+//    PostgreSQL these columns become `Decimal(19,4)`.
+//  * Nullable columns are avoided inside unique constraints because SQLite
+//    treats NULLs as distinct. Scope discriminators use a sentinel string
+//    (e.g. `channelScope = "store"`) instead.
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ===========================================================================
+// Identity and access
+// ===========================================================================
+
+model User {
+  id          String    @id @default(cuid())
+  email       String    @unique
+  name        String
+  jobTitle    String?
+  /// UserRole — see src/lib/enums.ts
+  role        String    @default("COMPANY_ADMIN")
+  avatarColor String    @default("#2563eb")
+  isActive    Boolean   @default(true)
+  lastLoginAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  memberships        OrganisationMembership[]
+  sessions           Session[]
+  auditEvents        AuditEvent[]
+  notifications      Notification[]
+  requestedApprovals ApprovalRequest[]        @relation("ApprovalRequester")
+  decidedApprovals   ApprovalRequest[]        @relation("ApprovalApprover")
+  initiatedJobs      SyncJob[]
+  createdDeployments Deployment[]
+  savedViews         SavedView[]
+  credentialsCreated CredentialRecord[]
+  overridesSet       ResourceOverride[]
+  themeReleases      ThemeRelease[]
+  resolutions        ConflictResolution[]
+  provisioningPlans  ProvisioningPlan[]
+
+  @@index([email])
+}
+
+/// Server-side session. The cookie only ever carries an opaque random token;
+/// the database stores its SHA-256 hash so a database leak cannot mint sessions.
+model Session {
+  id             String    @id @default(cuid())
+  tokenHash      String    @unique
+  userId         String
+  organisationId String
+  activeCompanyId String?
+  activeStoreId   String?
+  activeChannelId String?
+  userAgent      String?
+  ipHash         String?
+  createdAt      DateTime  @default(now())
+  lastSeenAt     DateTime  @default(now())
+  expiresAt      DateTime
+  revokedAt      DateTime?
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Organisation {
+  id              String    @id @default(cuid())
+  name            String
+  slug            String    @unique
+  legalName       String?
+  reportingCurrency String  @default("USD")
+  defaultLocale   String    @default("en-US")
+  timezone        String    @default("UTC")
+  logoInitials    String    @default("CC")
+  accentColor     String    @default("#2563eb")
+  planTier        String    @default("Enterprise")
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  memberships   OrganisationMembership[]
+  sessions      Session[]
+  companies     Company[]
+  regions       Region[]
+  brands        Brand[]
+  environments  Environment[]
+  storeGroups   StoreGroup[]
+  connections   StoreConnection[]
+  channels      StorefrontChannel[]
+  relationships StoreRelationship[]
+  templates     ConfigurationTemplate[]
+  policies      InheritancePolicy[]
+  overrides     ResourceOverride[]
+  capabilities  StoreCapability[]
+  credentials   CredentialRecord[]
+  jobs          SyncJob[]
+  deployments   Deployment[]
+  approvals     ApprovalRequest[]
+  conflicts     Conflict[]
+  products      ProductSnapshot[]
+  productMaps   ProductMapping[]
+  categoryMaps  CategoryMapping[]
+  cgTemplates   CustomerGroupTemplate[]
+  cgMappings    CustomerGroupMapping[]
+  themeReleases ThemeRelease[]
+  themeAssigns  ThemeAssignment[]
+  content       ContentSnapshot[]
+  analytics     AnalyticsSnapshot[]
+  notifications Notification[]
+  auditEvents   AuditEvent[]
+  featureFlags  FeatureFlag[]
+  savedViews    SavedView[]
+  orders        OrderSnapshot[]
+  customers     CustomerSnapshot[]
+  promotions    PromotionSnapshot[]
+  pricing       PricingEntry[]
+  inventory     InventoryRecord[]
+  priceLists    PriceListSnapshot[]
+  manualActions ManualActionItem[]
+  provisioning  ProvisioningPlan[]
+}
+
+model OrganisationMembership {
+  id             String    @id @default(cuid())
+  organisationId String
+  userId         String
+  /// UserRole
+  role           String    @default("COMPANY_ADMIN")
+  /// Empty list = access to every company in the organisation.
+  companyScopeJson String  @default("[]")
+  isDefault      Boolean   @default(false)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([organisationId, userId])
+}
+
+// ===========================================================================
+// Organisational hierarchy
+// ===========================================================================
+
+model Company {
+  id                String    @id @default(cuid())
+  organisationId    String
+  name              String
+  slug              String
+  code              String
+  description       String?
+  /// BusinessModel — B2C | B2B | HYBRID | WHOLESALE | OUTLET | DEALER | FRANCHISE
+  businessModel     String    @default("B2C")
+  reportingCurrency String    @default("USD")
+  headquarters      String?
+  accentColor       String    @default("#2563eb")
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  deletedAt         DateTime?
+
+  organisation  Organisation            @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  regions       Region[]
+  storeGroups   StoreGroup[]
+  connections   StoreConnection[]
+  templates     ConfigurationTemplate[]
+  cgTemplates   CustomerGroupTemplate[]
+  jobs          SyncJob[]
+  deployments   Deployment[]
+  notifications Notification[]
+  auditEvents   AuditEvent[]
+  provisioning  ProvisioningPlan[]
+
+  @@unique([organisationId, slug])
+  @@index([organisationId])
+}
+
+model Region {
+  id              String    @id @default(cuid())
+  organisationId  String
+  companyId       String
+  name            String
+  code            String
+  /// Comma-separated ISO-3166 alpha-2 codes covered by the region.
+  countriesCsv    String    @default("")
+  timezone        String    @default("UTC")
+  defaultCurrency String    @default("USD")
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  organisation Organisation      @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  company      Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  connections  StoreConnection[]
+
+  @@unique([companyId, code])
+  @@index([organisationId])
+}
+
+model Brand {
+  id             String    @id @default(cuid())
+  organisationId String
+  name           String
+  slug           String
+  colorHex       String    @default("#0f172a")
+  description    String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  organisation Organisation      @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connections  StoreConnection[]
+
+  @@unique([organisationId, slug])
+}
+
+model Environment {
+  id             String   @id @default(cuid())
+  organisationId String
+  name           String
+  slug           String
+  isProduction   Boolean  @default(false)
+  /// GuardrailLevel — STRICT | STANDARD | RELAXED
+  guardrailLevel String   @default("STANDARD")
+  description    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organisation Organisation      @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connections  StoreConnection[]
+
+  @@unique([organisationId, slug])
+}
+
+/// An arbitrary grouping created inside this platform only. A store group has
+/// no counterpart in BigCommerce — it exists to target deployments and
+/// comparisons at a set of stores (e.g. "EMEA B2B", "Peak-season wave 1").
+model StoreGroup {
+  id             String    @id @default(cuid())
+  organisationId String
+  companyId      String?
+  name           String
+  slug           String
+  description    String?
+  /// GroupPurpose — OPERATIONAL | DEPLOYMENT_TARGET | REPORTING | MIGRATION
+  purpose        String    @default("OPERATIONAL")
+  colorHex       String    @default("#64748b")
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  organisation Organisation      @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  company      Company?          @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  members      StoreGroupMember[]
+
+  @@unique([organisationId, slug])
+}
+
+model StoreGroupMember {
+  id           String   @id @default(cuid())
+  storeGroupId String
+  connectionId String
+  addedAt      DateTime @default(now())
+
+  storeGroup StoreGroup      @relation(fields: [storeGroupId], references: [id], onDelete: Cascade)
+  connection StoreConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@unique([storeGroupId, connectionId])
+}
+
+// ===========================================================================
+// Stores, storefronts and relationships
+// ===========================================================================
+
+/// A configured link to a BigCommerce store. This is *not* a BigCommerce
+/// object: it is this platform's record of a store, its credentials, its place
+/// in the organisation hierarchy and its observed health.
+model StoreConnection {
+  id             String  @id @default(cuid())
+  organisationId String
+  companyId      String
+  regionId       String?
+  brandId        String?
+  environmentId  String?
+
+  name String
+  slug String
+
+  /// BigCommerce store hash. Null while a store is still being provisioned.
+  storeHash String?
+
+  /// ConnectionType — INDEPENDENT | MSF_PARENT | CHANNEL_CONNECTION | DEVELOPMENT | SANDBOX
+  connectionType String @default("INDEPENDENT")
+  /// HierarchyMode — INDEPENDENT | MASTER | INHERITED | TEMPLATE_BASED | MSF_PARENT | MSF_CHANNEL
+  hierarchyMode  String @default("INDEPENDENT")
+  /// StoreClassification — B2C | B2B | DEALER | FRANCHISE | OUTLET | WHOLESALE | INTERNAL
+  classification String @default("B2C")
+
+  masterConnectionId String?
+  templateId         String?
+
+  /// ConnectionStatus — PLANNED | CONNECTING | ACTIVE | DEGRADED | DISCONNECTED | ARCHIVED
+  status       String @default("PLANNED")
+  /// HealthStatus — HEALTHY | WARNING | CRITICAL | UNKNOWN
+  healthStatus String @default("UNKNOWN")
+  healthMessage String?
+
+  /// True when this connection is backed by seeded demo data rather than a real
+  /// BigCommerce store. Demo connections never make outbound API calls.
+  isDemo Boolean @default(true)
+
+  countryCode      String  @default("US")
+  currencyCode     String  @default("USD")
+  locale           String  @default("en-US")
+  timezone         String  @default("UTC")
+  primaryDomain    String?
+  controlPanelUrl  String?
+  platformPlan     String?
+  msfEnabled       Boolean @default(false)
+  storefrontLimit  Int?
+  storefrontsUsed  Int?
+  catalogVersion   String?
+  activeThemeName  String?
+  activeThemeVersion String?
+
+  lastSuccessfulSyncAt DateTime?
+  lastFailedSyncAt     DateTime?
+  lastErrorSummary     String?
+  lastVerifiedAt       DateTime?
+  connectedAt          DateTime?
+
+  notes String?
+  /// Cached headline metrics for the store directory, refreshed by analytics jobs.
+  metricsJson String @default("{}")
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  organisation Organisation           @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  company      Company                @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  region       Region?                @relation(fields: [regionId], references: [id], onDelete: SetNull)
+  brand        Brand?                 @relation(fields: [brandId], references: [id], onDelete: SetNull)
+  environment  Environment?           @relation(fields: [environmentId], references: [id], onDelete: SetNull)
+  master       StoreConnection?       @relation("MasterChild", fields: [masterConnectionId], references: [id], onDelete: SetNull)
+  children     StoreConnection[]      @relation("MasterChild")
+  template     ConfigurationTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+
+  channels          StorefrontChannel[]
+  credentials       CredentialRecord[]
+  capabilities      StoreCapability[]
+  overrides         ResourceOverride[]
+  groupMemberships  StoreGroupMember[]
+  parentLinks       StoreRelationship[] @relation("RelationshipParent")
+  childLinks        StoreRelationship[] @relation("RelationshipChild")
+  products          ProductSnapshot[]
+  pricing           PricingEntry[]
+  priceLists        PriceListSnapshot[]
+  inventory         InventoryRecord[]
+  orders            OrderSnapshot[]
+  customers         CustomerSnapshot[]
+  promotions        PromotionSnapshot[]
+  content           ContentSnapshot[]
+  themeAssignments  ThemeAssignment[]
+  analytics         AnalyticsSnapshot[]
+  cgMappings        CustomerGroupMapping[]
+  notifications     Notification[]
+  auditEvents       AuditEvent[]
+  manualActions     ManualActionItem[]
+  provisioningPlans ProvisioningPlan[]
+  sourcedTemplates  ConfigurationTemplate[] @relation("TemplateSource")
+  sourcedJobs       SyncJob[]               @relation("JobSource")
+  jobTargets        SyncJobTarget[]
+  jobItems          SyncJobItem[]
+  sourcedDeploys    Deployment[]            @relation("DeploymentSource")
+  deployTargets     DeploymentTarget[]
+  conflictsAsSource Conflict[]              @relation("ConflictSource")
+  conflictsAsTarget Conflict[]              @relation("ConflictTarget")
+  mapsAsMaster      ProductMapping[]        @relation("MappingMaster")
+  mapsAsTarget      ProductMapping[]        @relation("MappingTarget")
+  catMapsAsMaster   CategoryMapping[]       @relation("CategoryMappingMaster")
+  catMapsAsTarget   CategoryMapping[]       @relation("CategoryMappingTarget")
+
+  @@unique([organisationId, slug])
+  @@index([organisationId, companyId])
+  @@index([storeHash])
+  @@index([masterConnectionId])
+}
+
+/// A storefront channel inside a BigCommerce Multi-Storefront store. Channels
+/// belong to exactly one BigCommerce store and share that store's catalog and
+/// credentials.
+model StorefrontChannel {
+  id             String @id @default(cuid())
+  organisationId String
+  connectionId   String
+
+  /// BigCommerce channel id. Null for channels that only exist as a plan here.
+  externalChannelId Int?
+  externalSiteId    Int?
+  name              String
+  /// ChannelPlatform — bigcommerce | facebook | amazon | ebay | pos | custom
+  platform          String  @default("bigcommerce")
+  /// ChannelType — storefront | marketplace | pos | marketing | custom
+  channelType       String  @default("storefront")
+  /// ChannelStatus — active | prelaunch | inactive | connected | disconnected | terminated | archived
+  status            String  @default("active")
+  isDefault         Boolean @default(false)
+  isListableFromUI  Boolean @default(true)
+
+  siteUrl      String?
+  currencyCode String  @default("USD")
+  locale       String  @default("en-US")
+  countryCode  String  @default("US")
+  themeName    String?
+  /// CatalogAssignmentMode — ALL_PRODUCTS | ASSIGNED_ONLY | UNKNOWN
+  catalogMode  String  @default("UNKNOWN")
+  productCount Int?
+  notes        String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  organisation Organisation    @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   StoreConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  products      ProductSnapshot[]
+  pricing       PricingEntry[]
+  inventory     InventoryRecord[]
+  orders        OrderSnapshot[]
+  customers     CustomerSnapshot[]
+  promotions    PromotionSnapshot[]
+  content       ContentSnapshot[]
+  analytics     AnalyticsSnapshot[]
+  themeAssigns  ThemeAssignment[]
+  overrides     ResourceOverride[]
+  capabilities  StoreCapability[]
+  jobTargets    SyncJobTarget[]
+  deployTargets DeploymentTarget[]
+  conflicts     Conflict[]
+
+  @@unique([connectionId, name])
+  @@index([organisationId])
+  @@index([externalChannelId])
+}
+
+/// An explicit, auditable link between two stores. Kept separate from the
+/// denormalised `masterConnectionId` so history survives detachment.
+model StoreRelationship {
+  id             String    @id @default(cuid())
+  organisationId String
+  parentId       String
+  childId        String
+  /// RelationshipType — MASTER_CHILD | TEMPLATE_APPLIED | MSF_PARENT_CHANNEL | PEER_COMPARISON
+  relationshipType String
+  isActive       Boolean   @default(true)
+  establishedAt  DateTime  @default(now())
+  detachedAt     DateTime?
+  notes          String?
+
+  organisation Organisation    @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  parent       StoreConnection @relation("RelationshipParent", fields: [parentId], references: [id], onDelete: Cascade)
+  child        StoreConnection @relation("RelationshipChild", fields: [childId], references: [id], onDelete: Cascade)
+
+  @@unique([parentId, childId, relationshipType])
+  @@index([organisationId])
+}
+
+// ===========================================================================
+// Inheritance, templates and overrides
+// ===========================================================================
+
+model ConfigurationTemplate {
+  id             String @id @default(cuid())
+  organisationId String
+  companyId      String?
+  name           String
+  slug           String
+  description    String?
+  /// ScopeLevel — ORGANISATION | COMPANY | REGION
+  scopeLevel     String @default("ORGANISATION")
+  version        Int    @default(1)
+  /// TemplateStatus — DRAFT | PUBLISHED | ARCHIVED
+  status         String @default("DRAFT")
+  sourceConnectionId String?
+  /// Map of resourceCategory -> value object.
+  valuesJson     String @default("{}")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  deletedAt      DateTime?
+
+  organisation Organisation     @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  company      Company?         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  source       StoreConnection? @relation("TemplateSource", fields: [sourceConnectionId], references: [id], onDelete: SetNull)
+
+  connections StoreConnection[]
+  deployments Deployment[]      @relation("DeploymentTemplateSource")
+
+  @@unique([organisationId, slug])
+}
+
+/// How one resource category flows from a source into a scope.
+model InheritancePolicy {
+  id             String @id @default(cuid())
+  organisationId String
+  /// PolicyScopeType — ORGANISATION | COMPANY | REGION | STORE_GROUP | STORE
+  scopeType      String
+  scopeId        String
+  /// ResourceCategory — see src/lib/resource-categories.ts
+  resourceCategory String
+  /// InheritanceMode — DO_NOT_INHERIT | INHERIT_CONTINUOUS | COPY_ONCE
+  ///                 | INHERIT_WITH_OVERRIDES | REQUIRE_APPROVAL | READ_ONLY_COMPARISON
+  mode           String
+  /// InheritanceSourceType — MASTER_STORE | TEMPLATE | ORGANISATION_DEFAULT | COMPANY_DEFAULT
+  sourceType     String  @default("MASTER_STORE")
+  sourceId       String?
+  isActive       Boolean @default(true)
+  notes          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+
+  @@unique([scopeType, scopeId, resourceCategory])
+  @@index([organisationId, resourceCategory])
+}
+
+/// A value deliberately set at store (or channel) level that wins over any
+/// inherited value, subject to the category's inheritance mode.
+model ResourceOverride {
+  id             String @id @default(cuid())
+  organisationId String
+  connectionId   String
+  channelId      String?
+  /// "store" when the override applies to the whole store, otherwise the channel id.
+  channelScope   String @default("store")
+
+  resourceCategory String
+  resourceKey      String
+  resourceLabel    String?
+  valueJson        String
+  previousValueJson String?
+  reason           String?
+  /// OverrideStatus — ACTIVE | PENDING_APPROVAL | REVERTED | SUPERSEDED
+  status           String @default("ACTIVE")
+  setByUserId      String?
+  setAt            DateTime @default(now())
+  /// Set when the inherited source changed after this override was recorded.
+  sourceChangedAt  DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  organisation Organisation       @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   StoreConnection    @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  channel      StorefrontChannel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  setBy        User?              @relation(fields: [setByUserId], references: [id], onDelete: SetNull)
+
+  @@unique([connectionId, channelScope, resourceCategory, resourceKey])
+  @@index([organisationId, resourceCategory])
+}
+
+// ===========================================================================
+// Capability registry
+// ===========================================================================
+
+model StoreCapability {
+  id             String  @id @default(cuid())
+  organisationId String
+  connectionId   String
+  channelId      String?
+  capabilityKey  String
+  /// CapabilityStatus — AVAILABLE | READ_ONLY | PERMISSION_MISSING | PLAN_DEPENDENT
+  ///                  | MANUAL_ACTION | NOT_SUPPORTED | NOT_IMPLEMENTED
+  status         String
+  requiredScope  String?
+  channelApplicable Boolean @default(false)
+  storeEligible     Boolean @default(true)
+  planDependency    String?
+  unavailableReason String?
+  requiresConfirmation Boolean @default(false)
+  isReversible         Boolean @default(true)
+  /// VerificationSource — STATIC_REGISTRY | SCOPE_PROBE | LIVE_PROBE | DEMO
+  verificationSource String   @default("STATIC_REGISTRY")
+  lastVerifiedAt     DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  organisation Organisation       @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   StoreConnection    @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  channel      StorefrontChannel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, capabilityKey])
+  @@index([organisationId, capabilityKey])
+}
+
+// ===========================================================================
+// Credentials
+// ===========================================================================
+
+/// Encrypted BigCommerce credentials. The plaintext never leaves the server and
+/// is never returned by any API route — only `maskedHint` and `fingerprint`.
+model CredentialRecord {
+  id             String @id @default(cuid())
+  organisationId String
+  connectionId   String
+  /// CredentialType — API_ACCOUNT_TOKEN | CLIENT_ID | CLIENT_SECRET | WEBHOOK_SECRET
+  credentialType String
+  label          String
+
+  /// AES-256-GCM payload, base64. See src/lib/crypto/credentials.ts.
+  ciphertext String
+  iv         String
+  authTag    String
+  algorithm  String @default("aes-256-gcm")
+  keyVersion Int    @default(1)
+
+  /// Non-reversible identifiers safe to display and log.
+  maskedHint  String
+  fingerprint String
+
+  /// Scopes reported by BigCommerce (or declared by the operator), JSON array.
+  scopesJson String @default("[]")
+  /// CredentialStatus — ACTIVE | ROTATED | REVOKED | INVALID | UNVERIFIED
+  status     String @default("UNVERIFIED")
+
+  lastValidatedAt     DateTime?
+  lastValidationError String?
+  rotatedAt           DateTime?
+  expiresAt           DateTime?
+  createdByUserId     String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  organisation Organisation    @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   StoreConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  createdBy    User?           @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  @@unique([connectionId, credentialType, status])
+  @@index([organisationId])
+}
+
+// ===========================================================================
+// Jobs
+// ===========================================================================
+
+model SyncJob {
+  id             String @id @default(cuid())
+  organisationId String
+  companyId      String?
+  /// JobType — see src/lib/enums.ts
+  jobType        String
+  /// JobStatus — DRAFT | QUEUED | RUNNING | COMPLETED | PARTIAL | FAILED | CANCELLED | AWAITING_APPROVAL
+  status         String @default("DRAFT")
+  resourceCategory String?
+  correlationId  String @unique
+  isDryRun       Boolean @default(false)
+
+  initiatedByUserId  String?
+  sourceConnectionId String?
+  deploymentId       String?
+
+  scheduledFor DateTime?
+  startedAt    DateTime?
+  finishedAt   DateTime?
+
+  progressPercent Int @default(0)
+  totalCount      Int @default(0)
+  successCount    Int @default(0)
+  failureCount    Int @default(0)
+  skippedCount    Int @default(0)
+  retryCount      Int @default(0)
+
+  errorSummary     String?
+  dryRunResultJson String?
+  parametersJson   String  @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organisation Organisation     @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  company      Company?         @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  initiatedBy  User?            @relation(fields: [initiatedByUserId], references: [id], onDelete: SetNull)
+  source       StoreConnection? @relation("JobSource", fields: [sourceConnectionId], references: [id], onDelete: SetNull)
+  deployment   Deployment?      @relation(fields: [deploymentId], references: [id], onDelete: SetNull)
+
+  targets SyncJobTarget[]
+  items   SyncJobItem[]
+
+  @@index([organisationId, status])
+  @@index([jobType])
+}
+
+model SyncJobTarget {
+  id           String @id @default(cuid())
+  jobId        String
+  connectionId String
+  channelId    String?
+  status       String @default("QUEUED")
+  startedAt    DateTime?
+  finishedAt   DateTime?
+  successCount Int @default(0)
+  failureCount Int @default(0)
+  skippedCount Int @default(0)
+  errorSummary String?
+
+  job        SyncJob            @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  connection StoreConnection    @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  channel    StorefrontChannel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  items      SyncJobItem[]
+
+  @@unique([jobId, connectionId, channelId])
+}
+
+model SyncJobItem {
+  id           String  @id @default(cuid())
+  jobId        String
+  targetId     String?
+  connectionId String?
+  resourceType String
+  resourceKey  String
+  resourceLabel String?
+  /// ItemAction — CREATE | UPDATE | DELETE | SKIP | NO_CHANGE | MANUAL
+  action       String
+  /// ItemStatus — PENDING | RUNNING | SUCCEEDED | FAILED | SKIPPED | BLOCKED
+  status       String  @default("PENDING")
+  beforeJson   String?
+  afterJson    String?
+  message      String?
+  durationMs   Int?
+  attempt      Int     @default(0)
+  createdAt    DateTime @default(now())
+
+  job        SyncJob          @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  target     SyncJobTarget?   @relation(fields: [targetId], references: [id], onDelete: Cascade)
+  connection StoreConnection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+
+  @@index([jobId, status])
+}
+
+// ===========================================================================
+// Deployments and approvals
+// ===========================================================================
+
+model Deployment {
+  id             String @id @default(cuid())
+  organisationId String
+  companyId      String?
+  name           String
+  description    String?
+  resourceCategory String
+  /// DeploymentStatus — DRAFT | AWAITING_APPROVAL | APPROVED | REJECTED | QUEUED
+  ///                  | RUNNING | COMPLETED | PARTIAL | FAILED | CANCELLED | ROLLED_BACK
+  status         String @default("DRAFT")
+  /// DeploymentStrategy — COPY_ONCE | SYNC | OVERWRITE | ADDITIVE_ONLY
+  strategy       String @default("COPY_ONCE")
+  /// RiskLevel — LOW | MEDIUM | HIGH | CRITICAL
+  riskLevel      String @default("LOW")
+
+  sourceConnectionId String?
+  sourceTemplateId   String?
+  createdByUserId    String?
+
+  requiresApproval  Boolean  @default(false)
+  approvalRequestId String?
+  scheduledFor      DateTime?
+  dryRunAt          DateTime?
+  startedAt         DateTime?
+  finishedAt        DateTime?
+
+  dryRunSummaryJson String?
+  blastRadiusJson   String?
+  rollbackInfoJson  String?
+  preserveLocalOverrides Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  organisation Organisation           @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  company      Company?               @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  source       StoreConnection?       @relation("DeploymentSource", fields: [sourceConnectionId], references: [id], onDelete: SetNull)
+  template     ConfigurationTemplate? @relation("DeploymentTemplateSource", fields: [sourceTemplateId], references: [id], onDelete: SetNull)
+  createdBy    User?                  @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  targets DeploymentTarget[]
+  items   DeploymentItem[]
+  jobs    SyncJob[]
+
+  @@index([organisationId, status])
+}
+
+model DeploymentTarget {
+  id           String @id @default(cuid())
+  deploymentId String
+  connectionId String
+  channelId    String?
+  status       String @default("PENDING")
+  plannedCount Int @default(0)
+  appliedCount Int @default(0)
+  failedCount  Int @default(0)
+  skippedCount Int @default(0)
+  hasLocalOverrides   Boolean @default(false)
+  requiresManualAction Boolean @default(false)
+  unsupportedReason   String?
+  errorSummary        String?
+
+  deployment Deployment         @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+  connection StoreConnection    @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  channel    StorefrontChannel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  items      DeploymentItem[]
+
+  @@unique([deploymentId, connectionId, channelId])
+}
+
+model DeploymentItem {
+  id           String @id @default(cuid())
+  deploymentId String
+  targetId     String
+  resourceType String
+  resourceKey  String
+  resourceLabel String?
+  /// ChangeType — CREATE | UPDATE | DELETE | NO_CHANGE | UNSUPPORTED | MANUAL
+  changeType   String
+  status       String  @default("PLANNED")
+  beforeJson   String?
+  afterJson    String?
+  validationJson String?
+  isDestructive Boolean @default(false)
+  message      String?
+
+  deployment Deployment       @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+  target     DeploymentTarget @relation(fields: [targetId], references: [id], onDelete: Cascade)
+
+  @@index([deploymentId, changeType])
+}
+
+model ApprovalRequest {
+  id             String @id @default(cuid())
+  organisationId String
+  /// ApprovalSubjectType — DEPLOYMENT | RESOURCE_OVERRIDE | CONFLICT_RESOLUTION
+  ///                     | THEME_RELEASE | CUSTOMER_GROUP_TEMPLATE | CREDENTIAL_ROTATION
+  subjectType    String
+  subjectId      String
+  title          String
+  reason         String?
+  changeSummary  String?
+  targetScope    String?
+  /// RiskLevel
+  riskLevel      String @default("LOW")
+  /// ApprovalStatus — PENDING | APPROVED | REJECTED | CANCELLED | EXPIRED
+  status         String @default("PENDING")
+
+  requesterId     String
+  approverId      String?
+  decisionComment String?
+  decidedAt       DateTime?
+  expiresAt       DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  requester    User         @relation("ApprovalRequester", fields: [requesterId], references: [id], onDelete: Cascade)
+  approver     User?        @relation("ApprovalApprover", fields: [approverId], references: [id], onDelete: SetNull)
+
+  @@index([organisationId, status])
+}
+
+// ===========================================================================
+// Comparison and conflicts
+// ===========================================================================
+
+model Conflict {
+  id             String @id @default(cuid())
+  organisationId String
+  resourceCategory String
+  /// ConflictType — MISSING_IN_TARGET | EXTRA_IN_TARGET | VALUE_MISMATCH | LOCAL_OVERRIDE
+  ///              | SOURCE_CHANGED_AFTER_OVERRIDE | UNSUPPORTED_TARGET_CAPABILITY
+  ///              | PERMISSION_MISSING | INVALID_MAPPING | DEPLOYMENT_FAILURE
+  conflictType   String
+  sourceConnectionId String?
+  targetConnectionId String
+  channelId          String?
+
+  resourceType  String
+  resourceKey   String
+  resourceLabel String?
+
+  sourceValueJson String?
+  targetValueJson String?
+  diffJson        String?
+
+  /// Severity — LOW | MEDIUM | HIGH | CRITICAL
+  severity String @default("MEDIUM")
+  /// ConflictStatus — OPEN | ACKNOWLEDGED | RESOLVED | ACCEPTED_VARIANCE | EXCLUDED | MANUAL_REVIEW
+  status   String @default("OPEN")
+
+  detectedAt DateTime  @default(now())
+  lastSeenAt DateTime  @default(now())
+  resolvedAt DateTime?
+
+  organisation Organisation       @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  source       StoreConnection?   @relation("ConflictSource", fields: [sourceConnectionId], references: [id], onDelete: SetNull)
+  target       StoreConnection    @relation("ConflictTarget", fields: [targetConnectionId], references: [id], onDelete: Cascade)
+  channel      StorefrontChannel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  resolutions ConflictResolution[]
+
+  @@unique([targetConnectionId, resourceCategory, resourceKey, conflictType])
+  @@index([organisationId, status])
+}
+
+model ConflictResolution {
+  id         String @id @default(cuid())
+  conflictId String
+  /// ResolutionAction — KEEP_MASTER | KEEP_LOCAL | COPY_MASTER_ONCE | RE_ENABLE_INHERITANCE
+  ///                  | ACCEPT_VARIANCE | EXCLUDE_FROM_COMPARISON | MANUAL_REVIEW
+  action     String
+  resolvedByUserId String?
+  note       String?
+  appliedJobId String?
+  /// ResolutionOutcome — APPLIED | QUEUED | RECORDED | FAILED
+  outcome    String   @default("RECORDED")
+  createdAt  DateTime @default(now())
+
+  conflict   Conflict @relation(fields: [conflictId], references: [id], onDelete: Cascade)
+  resolvedBy User?    @relation(fields: [resolvedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([conflictId])
+}
+
+// ===========================================================================
+// Catalog, pricing and inventory snapshots
+//
+// These are deliberately *snapshots*, not a mirror of the BigCommerce catalog.
+// They exist to power comparison, drift detection and dry-runs. See
+// docs/architecture.md, "Why we snapshot rather than sync".
+// ===========================================================================
+
+model ProductSnapshot {
+  id             String @id @default(cuid())
+  organisationId String
+  connectionId   String
+  channelId      String?
+
+  externalProductId Int
+  sku               String
+  name              String
+  productType       String @default("physical")
+  brandName         String?
+  /// Exact decimal string, paired with currencyCode.
+  price             String  @default("0.00")
+  salePrice         String?
+  retailPrice       String?
+  costPrice         String?
+  currencyCode      String  @default("USD")
+  inventoryLevel    Int?
+  inventoryTracking String  @default("none")
+  isVisible         Boolean @default(true)
+  availability      String  @default("available")
+  categoriesJson    String  @default("[]")
+  channelsJson      String  @default("[]")
+  customFieldsJson  String  @default("[]")
+  imageUrl          String?
+  seoTitle          String?
+  seoDescription    String?
+  weight            String?
+  variantCount      Int     @default(0)
+  /// Content hash of the comparable fields, used for cheap drift detection.
+  checksum          String
+  /// SnapshotSource — DEMO | API | IMPORT
+  source            String  @default("DEMO")
+  externalModifiedAt DateTime?
+  capturedAt        DateTime @default(now())
+
+  organisation Organisation       @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   StoreConnection    @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  channel      StorefrontChannel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, externalProductId])
+  @@index([organisationId, sku])
+  @@index([connectionId, sku])
+}
+
+/// Product identity across independent stores. BigCommerce product ids are
+/// per-store, so cross-store operations must go through an explicit mapping.
+model ProductMapping {
+  id             String @id @default(cuid())
+  organisationId String
+  masterConnectionId String
+  masterProductId    Int
+  masterSku          String
+  targetConnectionId String
+  targetProductId    Int?
+  targetSku          String?
+  /// MappingStatus — MAPPED | MISSING_IN_TARGET | EXTRA_IN_TARGET | AMBIGUOUS | MANUAL | EXCLUDED
+  mappingStatus  String @default("MAPPED")
+  /// MatchStrategy — SKU | EXTERNAL_ID | NAME | MANUAL
+  matchStrategy  String @default("SKU")
+  confidence     Float  @default(1)
+  driftFieldsJson String @default("[]")
+  lastComparedAt DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organisation Organisation    @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  master       StoreConnection @relation("MappingMaster", fields: [masterConnectionId], references: [id], onDelete: Cascade)
+  target       StoreConnection @relation("MappingTarget", fields: [targetConnectionId], references: [id], onDelete: Cascade)
+
+  @@unique([masterConnectionId, masterProductId, targetConnectionId])
+  @@index([organisationId, mappingStatus])
+}
+
+model CategoryMapping {
+  id             String @id @default(cuid())
+  organisationId String
+  masterConnectionId String
+  masterCategoryId   Int
+  masterPath         String
+  targetConnectionId String
+  targetCategoryId   Int?
+  targetPath         String?
+  mappingStatus  String @default("MAPPED")
+  matchStrategy  String @default("PATH")
+  lastComparedAt DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organisation Organisation    @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  master       StoreConnection @relation("CategoryMappingMaster", fields: [masterConnectionId], references: [id], onDelete: Cascade)
+  target       StoreConnection @relation("CategoryMappingTarget", fields: [targetConnectionId], references: [id], onDelete: Cascade)
+
+  @@unique([masterConnectionId, masterCategoryId, targetConnectionId])
+}
+
+model PriceListSnapshot {
+  id             String @id @default(cuid())
+  organisationId String
+  connectionId   String
+  externalPriceListId Int
+  name           String
+  currencyCode   String?
+  isActive       Boolean @default(true)
+  recordCount    Int     @default(0)
+  assignmentsJson String @default("[]")
+  capturedAt     DateTime @default(now())
+
+  organisation Organisation    @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   StoreConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, externalPriceListId])
+}
+
+model PricingEntry {
+  id             String @id @default(cuid())
+  organisationId String
+  connectionId   String
+  channelId      String?
+  channelScope   String @default("store")
+
+  sku             String
+  externalProductId Int?
+  variantSku      String?
+  currencyCode    String
+  basePrice       String
+  salePrice       String?
+  retailPrice     String?
+  costPrice       String?
+  priceListExternalId Int?
+  priceListName   String?
+  customerGroupExternalId Int?
+  customerGroupName String?
+  effectiveFrom   DateTime?
+  effectiveTo     DateTime?
+  /// PriceOrigin — BASE | PRICE_LIST | LOCAL_OVERRIDE | INHERITED_COPY | CALCULATED_DISPLAY
+  origin          String @default("BASE")
+  isOverride      Boolean @default(false)
+  capturedAt      DateTime @default(now())
+
+  organisation Organisation       @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   StoreConnection    @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  channel      StorefrontChannel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@index([organisationId, sku])
+  @@index([connectionId, sku])
+}
+
+model InventoryRecord {
+  id             String @id @default(cuid())
+  organisationId String
+  connectionId   String
+  channelId      String?
+  locationExternalId Int?
+  locationName   String?
+
+  sku               String
+  externalProductId Int?
+  externalVariantId Int?
+  productName       String?
+  quantity          Int     @default(0)
+  safetyStock       Int     @default(0)
+  buffer            Int     @default(0)
+  lowStockThreshold Int     @default(5)
+  /// StockStatus — IN_STOCK | LOW | OUT_OF_STOCK | BACKORDER | NOT_TRACKED
+  status            String  @default("IN_STOCK")
+  /// InventoryStrategy — INDEPENDENT | MASTER_SOURCE | COPIED_SNAPSHOT
+  ///                   | EXTERNAL_SYSTEM | READ_ONLY_REPORTING | SHARED_POLICY_LOCAL_QTY
+  strategy          String  @default("INDEPENDENT")
+  dataSource        String  @default("DEMO")
+  externalUpdatedAt DateTime?
+  capturedAt        DateTime @default(now())
+
+  organisation Organisation       @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   StoreConnection    @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  channel      StorefrontChannel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@index([organisationId, status])
+  @@index([connectionId, sku])
+}
+
+// ===========================================================================
+// Orders and customers
+// ===========================================================================
+
+model OrderSnapshot {
+  id             String @id @default(cuid())
+  organisationId String
+  connectionId   String
+  channelId      String?
+
+  externalOrderId Int
+  orderNumber     String
+  /// Raw BigCommerce status label, preserved verbatim.
+  statusLabel     String
+  /// OrderStatusCategory — PENDING | PROCESSING | FULFILLED | CANCELLED | REFUNDED | FAILED
+  statusCategory  String
+  paymentStatus   String  @default("unknown")
+  fulfilmentStatus String @default("unfulfilled")
+  refundStatus    String  @default("none")
+
+  currencyCode   String
+  subtotal       String  @default("0.00")
+  shippingTotal  String  @default("0.00")
+  taxTotal       String  @default("0.00")
+  discountTotal  String  @default("0.00")
+  grandTotal     String  @default("0.00")
+  refundedTotal  String  @default("0.00")
+  itemCount      Int     @default(0)
+
+  customerExternalId Int?
+  customerName       String?
+  /// Masked for display; full personal data is fetched on demand from the API.
+  customerEmailMasked String?
+  countryCode        String?
+  paymentMethod      String?
+  orderSource        String?
+  staffNotes         String?
+
+  placedAt          DateTime
+  externalUpdatedAt DateTime?
+  capturedAt        DateTime @default(now())
+  isDemo            Boolean  @default(true)
+
+  organisation Organisation       @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   StoreConnection    @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  channel      StorefrontChannel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  lines  OrderLineSnapshot[]
+  events OrderEvent[]
+
+  @@unique([connectionId, externalOrderId])
+  @@index([organisationId, placedAt])
+  @@index([connectionId, statusCategory])
+}
+
+model OrderLineSnapshot {
+  id       String @id @default(cuid())
+  orderId  String
+  sku      String
+  name     String
+  quantity Int
+  unitPrice String
+  lineTotal String
+  externalProductId Int?
+  variantLabel String?
+
+  order OrderSnapshot @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+}
+
+model OrderEvent {
+  id      String   @id @default(cuid())
+  orderId String
+  occurredAt DateTime
+  label   String
+  detail  String?
+  actor   String?
+
+  order OrderSnapshot @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+}
+
+/// Minimal customer record. Personal data is deliberately reduced: we keep a
+/// masked email for display and a salted hash for cross-store *reporting only*
+/// — identities are never merged automatically. See docs/security.md.
+model CustomerSnapshot {
+  id             String @id @default(cuid())
+  organisationId String
+  connectionId   String
+  channelId      String?
+
+  externalCustomerId Int
+  firstName          String?
+  lastName           String?
+  emailMasked        String
+  emailHash          String
+  phoneMasked        String?
+  company            String?
+  customerGroupExternalId Int?
+  customerGroupName  String?
+  countryCode        String?
+  /// CustomerStatus — ACTIVE | DISABLED | GUEST | PENDING_VALIDATION
+  status             String  @default("ACTIVE")
+  acceptsMarketing   Boolean @default(false)
+  orderCount         Int     @default(0)
+  lifetimeValue      String  @default("0.00")
+  currencyCode       String  @default("USD")
+  storeCredit        String  @default("0.00")
+  externalCreatedAt  DateTime?
+  lastOrderAt        DateTime?
+  capturedAt         DateTime @default(now())
+
+  organisation Organisation       @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   StoreConnection    @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  channel      StorefrontChannel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, externalCustomerId])
+  @@index([organisationId, emailHash])
+}
+
+model CustomerGroupTemplate {
+  id             String @id @default(cuid())
+  organisationId String
+  companyId      String?
+  name           String
+  description    String?
+  version        Int     @default(1)
+  /// TemplateStatus — DRAFT | PUBLISHED | ARCHIVED
+  status         String  @default("DRAFT")
+  isDefaultGroup Boolean @default(false)
+  /// DiscountType — PERCENT | FIXED | PRICE_LIST | NONE
+  discountType   String  @default("NONE")
+  discountValue  String  @default("0.00")
+  categoryAccessJson String @default("{\"type\":\"all\"}")
+  priceListRefsJson  String @default("[]")
+  channelAssignmentJson String @default("[]")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  company      Company?     @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  mappings     CustomerGroupMapping[]
+
+  @@unique([organisationId, name])
+}
+
+/// Bridges a platform-level customer-group template to the numeric group id
+/// that exists inside one specific BigCommerce store. Ids are never assumed
+/// to match across stores.
+model CustomerGroupMapping {
+  id             String @id @default(cuid())
+  organisationId String
+  templateId     String?
+  connectionId   String
+  externalGroupId   Int?
+  externalGroupName String
+  /// CustomerGroupMappingStatus — MAPPED | MISSING_IN_TARGET | NAME_CONFLICT
+  ///                            | PENDING_DEPLOY | DEPLOYED | UNMANAGED
+  status         String @default("UNMANAGED")
+  discountSummary String?
+  memberCount    Int?
+  lastDeployedAt DateTime?
+  notes          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organisation Organisation           @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  template     CustomerGroupTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  connection   StoreConnection        @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, externalGroupName])
+  @@index([organisationId, status])
+}
+
+// ===========================================================================
+// Themes and content
+// ===========================================================================
+
+model ThemeRelease {
+  id             String @id @default(cuid())
+  organisationId String
+  name           String
+  version        String
+  /// ThemeReleaseStatus — DRAFT | MANAGED | PUBLISHED | DEPRECATED
+  status         String @default("DRAFT")
+  packageFileName String?
+  packageSizeBytes Int?
+  checksum       String?
+  releaseNotes   String?
+  compatibilityJson String @default("{}")
+  /// True when the package was never really uploaded (demo mode).
+  isSimulated    Boolean @default(true)
+  uploadedByUserId String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  uploadedBy   User?        @relation(fields: [uploadedByUserId], references: [id], onDelete: SetNull)
+  assignments  ThemeAssignment[]
+
+  @@unique([organisationId, name, version])
+}
+
+model ThemeAssignment {
+  id             String @id @default(cuid())
+  organisationId String
+  connectionId   String
+  channelId      String?
+  themeReleaseId String?
+
+  activeThemeName    String
+  activeThemeVersion String
+  externalThemeUuid  String?
+  /// ThemeAssignmentState — ACTIVE | DRAFT | PENDING_DEPLOY | FAILED | ROLLED_BACK | UNMANAGED
+  state              String  @default("ACTIVE")
+  hasLocalModifications Boolean @default(false)
+  localModificationSummary String?
+  configSnapshotJson String  @default("{}")
+  previewUrl         String?
+  deployedAt         DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  organisation Organisation       @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   StoreConnection    @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  channel      StorefrontChannel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  release      ThemeRelease?      @relation(fields: [themeReleaseId], references: [id], onDelete: SetNull)
+
+  @@unique([connectionId, channelId])
+  @@index([organisationId, state])
+}
+
+model ContentSnapshot {
+  id             String @id @default(cuid())
+  organisationId String
+  connectionId   String?
+  channelId      String?
+  /// ContentScopeLevel — GLOBAL | COMPANY | REGION | BRAND | STORE | CHANNEL
+  scopeLevel     String @default("STORE")
+  scopeRefId     String?
+  /// ContentType — PAGE | NAVIGATION | WIDGET | BANNER | SCRIPT | REDIRECT | SEO | BLOG
+  contentType    String
+  externalId     String?
+  contentKey     String
+  title          String
+  /// ContentStatus — DRAFT | REVIEW | APPROVED | SCHEDULED | PUBLISHED | FAILED | ARCHIVED
+  status         String @default("DRAFT")
+  bodyJson       String @default("{}")
+  metaJson       String @default("{}")
+  checksum       String?
+  isOverride     Boolean @default(false)
+  inheritedFromId String?
+  scheduledFor   DateTime?
+  publishedAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organisation Organisation       @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   StoreConnection?   @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  channel      StorefrontChannel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@index([organisationId, contentType])
+  @@index([connectionId, contentType])
+}
+
+// ===========================================================================
+// Analytics
+// ===========================================================================
+
+/// Pre-aggregated metrics per store/channel/period. Currency is always stored
+/// alongside the amounts; totals across currencies are never pre-summed.
+model AnalyticsSnapshot {
+  id             String @id @default(cuid())
+  organisationId String
+  connectionId   String?
+  channelId      String?
+  channelScope   String @default("store")
+
+  periodStart DateTime
+  periodEnd   DateTime
+  /// Granularity — DAY | WEEK | MONTH
+  granularity String @default("DAY")
+
+  currencyCode String
+  revenue      String @default("0.00")
+  refundValue  String @default("0.00")
+  orderCount   Int    @default(0)
+  refundCount  Int    @default(0)
+  unitsSold    Int    @default(0)
+  newCustomers Int    @default(0)
+  returningCustomers Int @default(0)
+  sessions     Int?
+  conversionRate Float?
+  /// AnalyticsSource — DEMO | API | DERIVED
+  source       String @default("DEMO")
+  capturedAt   DateTime @default(now())
+
+  organisation Organisation       @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   StoreConnection?   @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  channel      StorefrontChannel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, channelScope, periodStart, granularity])
+  @@index([organisationId, periodStart])
+}
+
+// ===========================================================================
+// Promotions
+// ===========================================================================
+
+model PromotionSnapshot {
+  id             String @id @default(cuid())
+  organisationId String
+  connectionId   String
+  channelId      String?
+
+  externalPromotionId Int?
+  name           String
+  /// PromotionType — CART_LEVEL | PRODUCT_LEVEL | SHIPPING | COUPON | AUTOMATIC
+  promotionType  String @default("AUTOMATIC")
+  /// PromotionStatus — DRAFT | SCHEDULED | ACTIVE | PAUSED | EXPIRED | ARCHIVED
+  status         String @default("DRAFT")
+  couponCode     String?
+  redemptionType String  @default("AUTOMATIC")
+  discountSummary String
+  startsAt       DateTime?
+  endsAt         DateTime?
+  usageCount     Int     @default(0)
+  usageLimit     Int?
+  channelsJson   String  @default("[]")
+  currencyCode   String  @default("USD")
+  capturedAt     DateTime @default(now())
+
+  organisation Organisation       @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   StoreConnection    @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  channel      StorefrontChannel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@index([organisationId, status])
+}
+
+// ===========================================================================
+// Provisioning and manual actions
+// ===========================================================================
+
+/// A guided plan for standing up a new BigCommerce store. There is no public
+/// BigCommerce API that creates a new store account, so this tracks intent,
+/// manual steps and the eventual connection. See docs/capability-matrix.md.
+model ProvisioningPlan {
+  id             String @id @default(cuid())
+  organisationId String
+  companyId      String
+  name           String
+  intendedStoreName String
+  countryCode    String
+  currencyCode   String
+  locale         String
+  regionName     String?
+  brandName      String?
+  environmentName String @default("Production")
+  /// ProvisioningKind — INDEPENDENT_STORE | MSF_CHANNEL
+  kind           String @default("INDEPENDENT_STORE")
+  /// ProvisioningStatus — DRAFT | IN_PROGRESS | AWAITING_BIGCOMMERCE | CONNECTED | COMPLETED | ABANDONED
+  status         String @default("DRAFT")
+  templateId     String?
+  connectionId   String?
+  parentConnectionId String?
+  createdByUserId String?
+  notes          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organisation Organisation     @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  company      Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  connection   StoreConnection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+  createdBy    User?            @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
+  steps        ProvisioningStep[]
+
+  @@index([organisationId, status])
+}
+
+model ProvisioningStep {
+  id       String @id @default(cuid())
+  planId   String
+  position Int
+  title    String
+  description String
+  category String
+  /// AutomationLevel — AUTOMATED | PARTIAL | MANUAL | UNSUPPORTED
+  automation String @default("MANUAL")
+  /// StepStatus — PENDING | IN_PROGRESS | COMPLETED | BLOCKED | NOT_APPLICABLE
+  status   String @default("PENDING")
+  docsUrl  String?
+  notes    String?
+  completedAt DateTime?
+  completedByUserId String?
+
+  plan ProvisioningPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@unique([planId, position])
+}
+
+/// A setting we can read (or want to set) but cannot change through a
+/// supported public API. Surfaces as an actionable checklist item.
+model ManualActionItem {
+  id             String @id @default(cuid())
+  organisationId String
+  connectionId   String?
+  deploymentId   String?
+  category       String
+  title          String
+  description    String
+  reason         String
+  currentValue   String?
+  desiredValue   String?
+  docsUrl        String?
+  /// ManualActionStatus — PENDING | IN_PROGRESS | COMPLETED | NOT_APPLICABLE
+  status         String @default("PENDING")
+  completedByUserId String?
+  completedAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organisation Organisation     @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  connection   StoreConnection? @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([organisationId, status])
+}
+
+// ===========================================================================
+// Platform records
+// ===========================================================================
+
+/// Catalogue of third-party connectors shown in the integrations directory.
+/// Display-only in v1 and intentionally global — it holds no tenant data.
+model ConnectorDefinition {
+  id          String  @id @default(cuid())
+  slug        String  @unique
+  name        String
+  vendor      String
+  category    String
+  shortDescription String
+  longDescription  String
+  logoSlug    String
+  logoColor   String  @default("0f172a")
+  docsUrl     String?
+  /// ConnectorStatus — AVAILABLE_FOR_CONFIGURATION | COMING_SOON | DISPLAY_ONLY | PARTNER_MANAGED
+  status      String  @default("COMING_SOON")
+  integrationType String @default("API")
+  supportsMultiStore Boolean @default(false)
+  tagsCsv     String  @default("")
+  sortOrder   Int     @default(100)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([category])
+}
+
+model Notification {
+  id             String @id @default(cuid())
+  organisationId String
+  userId         String?
+  companyId      String?
+  connectionId   String?
+  /// NotificationType — see src/lib/enums.ts
+  type           String
+  /// Severity — INFO | SUCCESS | WARNING | CRITICAL
+  severity       String @default("INFO")
+  title          String
+  body           String
+  actionLabel    String?
+  actionHref     String?
+  isRead         Boolean @default(false)
+  readAt         DateTime?
+  correlationId  String?
+  createdAt      DateTime @default(now())
+  expiresAt      DateTime?
+
+  organisation Organisation     @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  user         User?            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  company      Company?         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  connection   StoreConnection? @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([organisationId, isRead])
+}
+
+model AuditEvent {
+  id             String @id @default(cuid())
+  organisationId String
+  companyId      String?
+  connectionId   String?
+  channelId      String?
+  actorUserId    String?
+  /// ActorType — USER | SYSTEM | JOB | INTEGRATION
+  actorType      String @default("USER")
+  actorLabel     String?
+  action         String
+  resourceType   String
+  resourceId     String?
+  resourceLabel  String?
+  beforeSummary  String?
+  afterSummary   String?
+  /// AuditOutcome — SUCCESS | FAILURE | PARTIAL | BLOCKED | DRY_RUN
+  outcome        String @default("SUCCESS")
+  errorSummary   String?
+  ipHash         String?
+  sessionId      String?
+  correlationId  String?
+  metadataJson   String @default("{}")
+  createdAt      DateTime @default(now())
+
+  organisation Organisation     @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  company      Company?         @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  connection   StoreConnection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+  actor        User?            @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([organisationId, createdAt])
+  @@index([resourceType, resourceId])
+  @@index([correlationId])
+}
+
+model FeatureFlag {
+  id             String @id @default(cuid())
+  organisationId String
+  key            String
+  name           String
+  description    String
+  isEnabled      Boolean @default(false)
+  /// RolloutStage — GA | BETA | EXPERIMENTAL | DISABLED
+  rolloutStage   String  @default("EXPERIMENTAL")
+  category       String  @default("Platform")
+  updatedAt      DateTime @updatedAt
+  createdAt      DateTime @default(now())
+
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+
+  @@unique([organisationId, key])
+}
+
+model SavedView {
+  id             String @id @default(cuid())
+  organisationId String
+  userId         String
+  entity         String
+  name           String
+  filtersJson    String @default("{}")
+  columnsJson    String @default("[]")
+  sortJson       String @default("[]")
+  isShared       Boolean @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, entity, name])
+}
